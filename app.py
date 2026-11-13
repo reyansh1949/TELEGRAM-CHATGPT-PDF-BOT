@@ -6,7 +6,6 @@ import html
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
-from io import BytesIO
 
 import requests
 from flask import Flask, send_from_directory, abort
@@ -24,16 +23,20 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer,
-    Table, TableStyle, Image
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.utils import ImageReader
+
 
 # ---------------- CONFIG ----------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
 BASE_URL = os.environ.get(
     "BASE_URL",
     os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -43,6 +46,7 @@ PDF_DIR = Path("/tmp/pdfs")
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
+
 
 # ---------------- FONT ----------------
 
@@ -64,15 +68,22 @@ if bold_font.exists():
     )
     BOLD_FONT = "HindiFontBold"
 
+
 # ---------------- CHATGPT SHARE API ----------------
 
 def get_share_id(url):
     parsed = urlparse(url.strip())
 
-    if parsed.netloc not in ("chatgpt.com", "www.chatgpt.com"):
+    if parsed.netloc not in (
+        "chatgpt.com",
+        "www.chatgpt.com"
+    ):
         raise ValueError("Invalid ChatGPT share link")
 
-    match = re.search(r"/share/([^/?#]+)", parsed.path)
+    match = re.search(
+        r"/share/([^/?#]+)",
+        parsed.path
+    )
 
     if not match:
         raise ValueError("Share ID not found")
@@ -98,6 +109,7 @@ def fetch_conversation(url):
     )
 
     response.raise_for_status()
+
     data = response.json()
 
     if isinstance(data.get("data"), dict):
@@ -119,7 +131,11 @@ def get_active_path(data):
         path = []
         visited = set()
 
-        while current and current in mapping and current not in visited:
+        while (
+            current
+            and current in mapping
+            and current not in visited
+        ):
             visited.add(current)
             node = mapping[current]
             path.append(node)
@@ -127,14 +143,14 @@ def get_active_path(data):
 
         return list(reversed(path))
 
-    # Fallback if current_node is unavailable
     children = set()
 
     for node in mapping.values():
         children.update(node.get("children") or [])
 
     leaves = [
-        node_id for node_id in mapping
+        node_id
+        for node_id in mapping
         if node_id not in children
     ]
 
@@ -145,7 +161,11 @@ def get_active_path(data):
         path = []
         seen = set()
 
-        while node_id and node_id in mapping and node_id not in seen:
+        while (
+            node_id
+            and node_id in mapping
+            and node_id not in seen
+        ):
             seen.add(node_id)
             node = mapping[node_id]
             path.append(node)
@@ -177,9 +197,14 @@ def extract_text(content):
         elif isinstance(part, dict):
             if isinstance(part.get("text"), str):
                 result.append(part["text"])
+
             elif part.get("content_type") == "image":
                 result.append("[Image attached]")
-            elif part.get("content_type") in ("audio", "video"):
+
+            elif part.get("content_type") in (
+                "audio",
+                "video"
+            ):
                 result.append("[Media attached]")
 
     return "\n".join(result).strip()
@@ -194,7 +219,9 @@ def extract_chat(data):
         if not isinstance(message, dict):
             continue
 
-        role = (message.get("author") or {}).get("role")
+        role = (
+            message.get("author") or {}
+        ).get("role")
 
         if role not in ("user", "assistant"):
             continue
@@ -210,10 +237,13 @@ def extract_chat(data):
                 continue
 
             recipient = message.get("recipient")
+
             if recipient and recipient != "all":
                 continue
 
-        text = extract_text(message.get("content") or {})
+        text = extract_text(
+            message.get("content") or {}
+        )
 
         if text:
             messages.append({
@@ -227,6 +257,282 @@ def extract_chat(data):
     return messages
 
 
+# ---------------- LATEX FORMULA CONVERTER ----------------
+
+SUPER_MAP = str.maketrans(
+    "0123456789+-=()",
+    "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾"
+)
+
+SUB_MAP = str.maketrans(
+    "0123456789+-=()",
+    "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"
+)
+
+LATEX_SYMBOLS = {
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\theta": "θ",
+    r"\pi": "π",
+    r"\phi": "φ",
+    r"\varphi": "φ",
+    r"\lambda": "λ",
+    r"\omega": "ω",
+    r"\Delta": "Δ",
+    r"\Sigma": "Σ",
+    r"\Omega": "Ω",
+    r"\infty": "∞",
+    r"\times": "×",
+    r"\cdot": "·",
+    r"\div": "÷",
+    r"\pm": "±",
+    r"\mp": "∓",
+    r"\neq": "≠",
+    r"\leq": "≤",
+    r"\geq": "≥",
+    r"\approx": "≈",
+    r"\equiv": "≡",
+    r"\propto": "∝",
+    r"\in": "∈",
+    r"\notin": "∉",
+    r"\cup": "∪",
+    r"\cap": "∩",
+    r"\subset": "⊂",
+    r"\subseteq": "⊆",
+    r"\emptyset": "∅",
+    r"\therefore": "∴",
+    r"\because": "∵",
+    r"\perp": "⊥",
+    r"\parallel": "∥",
+    r"\rightarrow": "→",
+    r"\leftarrow": "←",
+    r"\Rightarrow": "⇒",
+    r"\Leftrightarrow": "⇔",
+    r"\degree": "°",
+    r"\cdots": "⋯",
+    r"\ldots": "…",
+    r"\sum": "∑",
+    r"\prod": "∏",
+    r"\int": "∫",
+    r"\partial": "∂",
+    r"\nabla": "∇",
+    r"\forall": "∀",
+    r"\exists": "∃",
+    r"\sin": "sin",
+    r"\cos": "cos",
+    r"\tan": "tan",
+    r"\cot": "cot",
+    r"\sec": "sec",
+    r"\csc": "csc",
+    r"\arcsin": "sin⁻¹",
+    r"\arccos": "cos⁻¹",
+    r"\arctan": "tan⁻¹",
+    r"\arccot": "cot⁻¹",
+    r"\arcsec": "sec⁻¹",
+    r"\arccsc": "csc⁻¹",
+    r"\log": "log",
+    r"\ln": "ln",
+    r"\lim": "lim",
+    r"\max": "max",
+    r"\min": "min",
+}
+
+
+def read_group(text, start):
+    if start >= len(text) or text[start] != "{":
+        return None, start
+
+    depth = 0
+
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+
+        elif text[i] == "}":
+            depth -= 1
+
+            if depth == 0:
+                return text[start + 1:i], i + 1
+
+    return None, start
+
+
+def replace_braced_commands(text):
+    commands = (
+        r"\dfrac",
+        r"\tfrac",
+        r"\frac",
+    )
+
+    for command in commands:
+        result = ""
+        i = 0
+
+        while i < len(text):
+            if text.startswith(command, i):
+                j = i + len(command)
+
+                while j < len(text) and text[j].isspace():
+                    j += 1
+
+                numerator, next_pos = read_group(text, j)
+
+                if numerator is not None:
+                    j = next_pos
+
+                    while j < len(text) and text[j].isspace():
+                        j += 1
+
+                    denominator, next_pos = read_group(text, j)
+
+                    if denominator is not None:
+                        result += (
+                            "(" + numerator + ")"
+                            + "⁄"
+                            + "(" + denominator + ")"
+                        )
+
+                        i = next_pos
+                        continue
+
+            result += text[i]
+            i += 1
+
+        text = result
+
+    # Square roots
+    result = ""
+    i = 0
+
+    while i < len(text):
+        if text.startswith(r"\sqrt", i):
+            j = i + 5
+
+            while j < len(text) and text[j].isspace():
+                j += 1
+
+            # Optional root index
+            if j < len(text) and text[j] == "[":
+                end = text.find("]", j)
+
+                if end != -1:
+                    root_index = text[j + 1:end]
+                    j = end + 1
+                else:
+                    root_index = ""
+            else:
+                root_index = ""
+
+            group, next_pos = read_group(text, j)
+
+            if group is not None:
+                if root_index:
+                    result += (
+                        root_index + "√(" + group + ")"
+                    )
+                else:
+                    result += "√(" + group + ")"
+
+                i = next_pos
+                continue
+
+        result += text[i]
+        i += 1
+
+    return result
+
+
+def latex_to_unicode(text):
+    # Math delimiters
+    text = text.replace(r"\(", "")
+    text = text.replace(r"\)", "")
+    text = text.replace(r"\[", "")
+    text = text.replace(r"\]", "")
+    text = text.replace("$$", "")
+    text = text.replace("$", "")
+
+    # Fractions and square roots
+    text = replace_braced_commands(text)
+
+    # Superscripts
+    text = re.sub(
+        r"\^\{([^{}]+)\}",
+        lambda m: m.group(1).translate(SUPER_MAP),
+        text
+    )
+
+    text = re.sub(
+        r"\^([0-9+\-=()])",
+        lambda m: m.group(1).translate(SUPER_MAP),
+        text
+    )
+
+    # Subscripts
+    text = re.sub(
+        r"_\{([^{}]+)\}",
+        lambda m: m.group(1).translate(SUB_MAP),
+        text
+    )
+
+    text = re.sub(
+        r"_([0-9+\-=()])",
+        lambda m: m.group(1).translate(SUB_MAP),
+        text
+    )
+
+    # Remove formatting commands
+    formatting_commands = (
+        r"\displaystyle",
+        r"\textstyle",
+        r"\scriptstyle",
+        r"\left",
+        r"\right",
+        r"\mathrm",
+        r"\mathbf",
+        r"\mathit",
+        r"\mathsf",
+        r"\mathtt",
+        r"\mathcal",
+        r"\mathbb",
+        r"\operatorname",
+        r"\text",
+        r"\boxed",
+        r"\overline",
+        r"\underline",
+        r"\vec",
+        r"\hat",
+        r"\bar",
+        r"\tilde",
+    )
+
+    for command in formatting_commands:
+        text = text.replace(command, "")
+
+    # Mathematical symbols
+    for command, symbol in sorted(
+        LATEX_SYMBOLS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True
+    ):
+        text = text.replace(command, symbol)
+
+    # Remaining basic commands
+    text = text.replace(r"\{", "{")
+    text = text.replace(r"\}", "}")
+    text = text.replace(r"\,", " ")
+    text = text.replace(r"\;", " ")
+    text = text.replace(r"\:", " ")
+    text = text.replace(r"\!", "")
+    text = text.replace(r"\ ", " ")
+    text = text.replace(r"\%", "%")
+    text = text.replace(r"\#", "#")
+    text = text.replace(r"\$", "$")
+
+    return text
+
+
 # ---------------- MARKDOWN ----------------
 
 def safe_text(value):
@@ -234,20 +540,25 @@ def safe_text(value):
 
 
 def format_inline(text):
+    text = latex_to_unicode(text)
+
     text = safe_text(text)
 
+    # Bold
     text = re.sub(
         r"\*\*(.+?)\*\*",
         r"<b>\1</b>",
         text
     )
 
+    # Italic
     text = re.sub(
         r"(?<!\*)\*([^*]+)\*(?!\*)",
         r"<i>\1</i>",
         text
     )
 
+    # Inline code
     text = re.sub(
         r"`(.+?)`",
         r'<font name="Courier">\1</font>',
@@ -300,7 +611,10 @@ def make_message_paragraphs(text, style):
             line = "• " + line[2:]
 
         output.append(
-            Paragraph(format_inline(line), style)
+            Paragraph(
+                format_inline(line),
+                style
+            )
         )
 
     return output
@@ -317,16 +631,13 @@ def create_bubble(message, styles):
         text_color = colors.HexColor("#17365D")
         heading = "You"
         alignment = "RIGHT"
-        left_padding = 12
-        right_padding = 12
+
     else:
         background = colors.HexColor("#EEEEEE")
         border = colors.HexColor("#DDDDDD")
         text_color = colors.HexColor("#242424")
         heading = "ChatGPT"
         alignment = "LEFT"
-        left_padding = 12
-        right_padding = 12
 
     bubble_style = ParagraphStyle(
         "BubbleText",
@@ -348,7 +659,10 @@ def create_bubble(message, styles):
     )
 
     content = [
-        Paragraph(heading, heading_style)
+        Paragraph(
+            heading,
+            heading_style
+        )
     ]
 
     content.extend(
@@ -367,8 +681,8 @@ def create_bubble(message, styles):
     bubble.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), background),
         ("BOX", (0, 0), (-1, -1), 0.7, border),
-        ("LEFTPADDING", (0, 0), (-1, -1), left_padding),
-        ("RIGHTPADDING", (0, 0), (-1, -1), right_padding),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
         ("TOPPADDING", (0, 0), (-1, -1), 9),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
         ("ROUNDEDCORNERS", [12, 12, 12, 12]),
@@ -405,13 +719,21 @@ def make_pdf(title, messages, filename):
     )
 
     story = [
-        Paragraph(safe_text(title), title_style),
+        Paragraph(
+            safe_text(title),
+            title_style
+        ),
         Spacer(1, 8),
     ]
 
     for message in messages:
-        story.append(create_bubble(message, styles))
-        story.append(Spacer(1, 10))
+        story.append(
+            create_bubble(message, styles)
+        )
+
+        story.append(
+            Spacer(1, 10)
+        )
 
     doc.build(story)
 
@@ -471,12 +793,21 @@ async def handle_message(
 
     try:
         data = fetch_conversation(url)
+
         messages = extract_chat(data)
 
-        title = data.get("title") or "ChatGPT Conversation"
+        title = (
+            data.get("title")
+            or "ChatGPT Conversation"
+        )
+
         filename = f"{uuid.uuid4()}.pdf"
 
-        make_pdf(title, messages, filename)
+        make_pdf(
+            title,
+            messages,
+            filename
+        )
 
         if not BASE_URL:
             raise ValueError("BASE_URL missing")
@@ -491,12 +822,14 @@ async def handle_message(
 
     except requests.exceptions.RequestException as error:
         print("REQUEST ERROR:", repr(error))
+
         await status.edit_text(
             "❌ ChatGPT Share Link से data नहीं मिला।"
         )
 
     except Exception as error:
         print("PDF ERROR:", repr(error))
+
         await status.edit_text(
             "❌ PDF बनाने में समस्या आई। Logs में error देखें।"
         )
@@ -505,7 +838,9 @@ async def handle_message(
 # ---------------- START SERVER ----------------
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
 
     app.run(
         host="0.0.0.0",
@@ -516,17 +851,26 @@ def run_flask():
 
 
 if __name__ == "__main__":
+
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable missing")
+        raise RuntimeError(
+            "BOT_TOKEN environment variable missing"
+        )
 
     threading.Thread(
         target=run_flask,
         daemon=True
     ).start()
 
-    bot = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    bot.add_handler(CommandHandler("start", start))
+    bot.add_handler(
+        CommandHandler("start", start)
+    )
 
     bot.add_handler(
         MessageHandler(
@@ -536,5 +880,6 @@ if __name__ == "__main__":
     )
 
     print("Telegram PDF Bot Started!")
+
     bot.run_polling()
     
