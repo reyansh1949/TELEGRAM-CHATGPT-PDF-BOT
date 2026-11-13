@@ -958,4 +958,52 @@ def make_pdf(title, messages, filename):
             spaceAfter=8,
         ),
 
-        "h2": Paragraph
+        
+"h2": ParagraphStyle(
+    "H2",
+    fontName=BOLD,
+    fontSize=12,
+    leading=16,
+    textColor=colors.HexColor("#202124"),
+    spaceBefore=6,
+    spaceAfter=6,
+),
+
+"h3": ParagraphStyle(
+    "H3",
+    fontName=BOLD,
+    fontSize=11,
+    leading=14,
+    textColor=colors.HexColor("#188038"),
+    spaceBefore=5,
+    spaceAfter=5,
+),
+
+"small": ParagraphStyle(
+    "Small",
+    fontName=REGULAR,
+    fontSize=8,
+    leading=11,
+    textColor=colors.HexColor("#777777"),
+),
+
+"user": ParagraphStyle(
+    "User",
+    fontName=BOLD,
+    fontSize=10,
+    leading=15,
+    textColor=colors.HexColor("#174EA6"),
+    spaceAfter=5,
+),
+
+"assistant": ParagraphStyle(
+    "Assistant",
+    fontName=REGULAR,
+    fontSize=10,
+    leading=15,
+    textColor=colors.HexColor("#252525"),
+    spaceAfter=5,
+),
+
+    }
+    
