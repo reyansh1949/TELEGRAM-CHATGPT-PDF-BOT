@@ -20,7 +20,7 @@ from telegram.ext import (
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import (
     SimpleDocTemplate,
@@ -28,12 +28,17 @@ from reportlab.platypus import (
     Spacer,
     Table,
     TableStyle,
+    KeepTogether,
+    HRFlowable,
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 
-# ---------------- CONFIG ----------------
+# ==================================================
+# CONFIGURATION
+# ==================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -47,41 +52,162 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
-
-# ---------------- FONT ----------------
-
-FONT = "Helvetica"
-BOLD_FONT = "Helvetica-Bold"
-
-regular_font = Path("NotoSansDevanagari-Regular.ttf")
-bold_font = Path("NotoSansDevanagari-Bold.ttf")
-
-if regular_font.exists():
-    pdfmetrics.registerFont(
-        TTFont("HindiFont", str(regular_font))
-    )
-    FONT = "HindiFont"
-
-if bold_font.exists():
-    pdfmetrics.registerFont(
-        TTFont("HindiFontBold", str(bold_font))
-    )
-    BOLD_FONT = "HindiFontBold"
+PAGE_WIDTH, PAGE_HEIGHT = A4
 
 
-# ---------------- CHATGPT SHARE API ----------------
+# ==================================================
+# FONT SYSTEM
+# ==================================================
+
+FONT_DIR = Path("fonts")
+
+def find_font(filename, system_paths=()):
+    candidates = [
+        FONT_DIR / filename,
+        Path(filename),
+        *[Path(p) for p in system_paths],
+    ]
+
+    for path in candidates:
+        if path.is_file():
+            return path
+
+    return None
+
+
+FONT_FILES = {
+    "Hindi": find_font("NotoSansDevanagari-Regular.ttf"),
+    "HindiBold": find_font("NotoSansDevanagari-Bold.ttf"),
+    "Math": find_font(
+        "DejaVuSans.ttf",
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    ),
+    "MathBold": find_font(
+        "DejaVuSans-Bold.ttf",
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    ),
+}
+
+FONT_NAMES = {}
+
+for name, path in FONT_FILES.items():
+    if path:
+        pdfmetrics.registerFont(TTFont(name, str(path)))
+        FONT_NAMES[name] = name
+
+REGULAR = (
+    "Math" if "Math" in FONT_NAMES else "Helvetica"
+)
+
+BOLD = (
+    "MathBold" if "MathBold" in FONT_NAMES else "Helvetica-Bold"
+)
+
+HINDI = (
+    "Hindi" if "Hindi" in FONT_NAMES else REGULAR
+)
+
+HINDI_BOLD = (
+    "HindiBold" if "HindiBold" in FONT_NAMES else BOLD
+)
+
+print("FONT STATUS:", FONT_NAMES)
+
+
+# ==================================================
+# FONT FALLBACK
+# ==================================================
+
+DEVANAGARI = re.compile(r"[\u0900-\u097F\uA8E0-\uA8FF]")
+
+def font_fallback(markup):
+    """
+    Switch between Hindi and mathematical fonts
+    while preserving ReportLab paragraph markup.
+    """
+
+    tokens = re.split(r"(<[^>]+>)", markup)
+
+    result = []
+    bold_mode = False
+    code_mode = False
+
+    for token in tokens:
+
+        if not token:
+            continue
+
+        if token == "<b>":
+            bold_mode = True
+            result.append(token)
+            continue
+
+        if token == "</b>":
+            bold_mode = False
+            result.append(token)
+            continue
+
+        if 'name="Courier"' in token:
+            code_mode = True
+            result.append(token)
+            continue
+
+        if token == "</font>":
+            code_mode = False
+            result.append(token)
+            continue
+
+        if token.startswith("<") and token.endswith(">"):
+            result.append(token)
+            continue
+
+        if code_mode:
+            result.append(token)
+            continue
+
+        chunks = re.split(
+            r"([\u0900-\u097F\uA8E0-\uA8FF]+)",
+            token
+        )
+
+        for chunk in chunks:
+            if not chunk:
+                continue
+
+            if DEVANAGARI.search(chunk):
+                selected = HINDI_BOLD if bold_mode else HINDI
+            else:
+                selected = BOLD if bold_mode else REGULAR
+
+            if selected in ("Helvetica", "Helvetica-Bold"):
+                result.append(chunk)
+            else:
+                result.append(
+                    f'<font name="{selected}">{chunk}</font>'
+                )
+
+    return "".join(result)
+
+
+# ==================================================
+# CHATGPT SHARE API
+# ==================================================
 
 def get_share_id(url):
+
     parsed = urlparse(url.strip())
 
-    if parsed.netloc not in (
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid URL")
+
+    if parsed.netloc.lower() not in (
         "chatgpt.com",
-        "www.chatgpt.com"
+        "www.chatgpt.com",
     ):
         raise ValueError("Invalid ChatGPT share link")
 
     match = re.search(
-        r"/share/([^/?#]+)",
+        r"/share/([a-zA-Z0-9-]+)",
         parsed.path
     )
 
@@ -92,6 +218,7 @@ def get_share_id(url):
 
 
 def fetch_conversation(url):
+
     share_id = get_share_id(url)
 
     api_url = (
@@ -105,7 +232,7 @@ def fetch_conversation(url):
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json",
         },
-        timeout=40,
+        timeout=45,
     )
 
     response.raise_for_status()
@@ -116,18 +243,24 @@ def fetch_conversation(url):
         data = data["data"]
 
     if not isinstance(data.get("mapping"), dict):
-        raise ValueError("Conversation data unavailable")
+        raise ValueError(
+            "Conversation data unavailable"
+        )
 
     return data
 
 
-# ---------------- EXTRACT CHAT ----------------
+# ==================================================
+# EXTRACT CONVERSATION
+# ==================================================
 
 def get_active_path(data):
+
     mapping = data["mapping"]
     current = data.get("current_node")
 
     if current in mapping:
+
         path = []
         visited = set()
 
@@ -158,6 +291,7 @@ def get_active_path(data):
         leaves = list(mapping)
 
     def build_path(node_id):
+
         path = []
         seen = set()
 
@@ -180,6 +314,7 @@ def get_active_path(data):
 
 
 def extract_text(content):
+
     if not isinstance(content, dict):
         return ""
 
@@ -191,10 +326,12 @@ def extract_text(content):
     result = []
 
     for part in parts:
+
         if isinstance(part, str):
             result.append(part)
 
         elif isinstance(part, dict):
+
             if isinstance(part.get("text"), str):
                 result.append(part["text"])
 
@@ -203,7 +340,7 @@ def extract_text(content):
 
             elif part.get("content_type") in (
                 "audio",
-                "video"
+                "video",
             ):
                 result.append("[Media attached]")
 
@@ -211,22 +348,24 @@ def extract_text(content):
 
 
 def extract_chat(data):
+
     messages = []
 
     for node in get_active_path(data):
+
         message = node.get("message")
 
         if not isinstance(message, dict):
             continue
 
-        role = (
-            message.get("author") or {}
-        ).get("role")
+        author = message.get("author") or {}
+        role = author.get("role")
 
         if role not in ("user", "assistant"):
             continue
 
         if role == "assistant":
+
             metadata = message.get("metadata") or {}
 
             if metadata.get("message_type") in (
@@ -257,7 +396,9 @@ def extract_chat(data):
     return messages
 
 
-# ---------------- LATEX FORMULA CONVERTER ----------------
+# ==================================================
+# MATHEMATICAL FORMULA CONVERTER
+# ==================================================
 
 SUPER_MAP = str.maketrans(
     "0123456789+-=()",
@@ -270,83 +411,87 @@ SUB_MAP = str.maketrans(
 )
 
 LATEX_SYMBOLS = {
-    r"\alpha": "α",
-    r"\beta": "β",
-    r"\gamma": "γ",
-    r"\delta": "δ",
-    r"\theta": "θ",
-    r"\pi": "π",
-    r"\phi": "φ",
-    r"\varphi": "φ",
-    r"\lambda": "λ",
-    r"\omega": "ω",
-    r"\Delta": "Δ",
-    r"\Sigma": "Σ",
-    r"\Omega": "Ω",
-    r"\infty": "∞",
-    r"\times": "×",
-    r"\cdot": "·",
-    r"\div": "÷",
-    r"\pm": "±",
-    r"\mp": "∓",
-    r"\neq": "≠",
-    r"\leq": "≤",
-    r"\geq": "≥",
-    r"\approx": "≈",
-    r"\equiv": "≡",
-    r"\propto": "∝",
-    r"\in": "∈",
-    r"\notin": "∉",
-    r"\cup": "∪",
-    r"\cap": "∩",
-    r"\subset": "⊂",
-    r"\subseteq": "⊆",
-    r"\emptyset": "∅",
-    r"\therefore": "∴",
-    r"\because": "∵",
-    r"\perp": "⊥",
-    r"\parallel": "∥",
-    r"\rightarrow": "→",
-    r"\leftarrow": "←",
-    r"\Rightarrow": "⇒",
-    r"\Leftrightarrow": "⇔",
-    r"\degree": "°",
-    r"\cdots": "⋯",
-    r"\ldots": "…",
-    r"\sum": "∑",
-    r"\prod": "∏",
-    r"\int": "∫",
-    r"\partial": "∂",
-    r"\nabla": "∇",
-    r"\forall": "∀",
-    r"\exists": "∃",
-    r"\sin": "sin",
-    r"\cos": "cos",
-    r"\tan": "tan",
-    r"\cot": "cot",
-    r"\sec": "sec",
-    r"\csc": "csc",
-    r"\arcsin": "sin⁻¹",
-    r"\arccos": "cos⁻¹",
-    r"\arctan": "tan⁻¹",
-    r"\arccot": "cot⁻¹",
-    r"\arcsec": "sec⁻¹",
-    r"\arccsc": "csc⁻¹",
-    r"\log": "log",
-    r"\ln": "ln",
-    r"\lim": "lim",
-    r"\max": "max",
-    r"\min": "min",
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "theta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "pi": "π",
+    "phi": "φ",
+    "varphi": "φ",
+    "omega": "ω",
+    "Delta": "Δ",
+    "Sigma": "Σ",
+    "Omega": "Ω",
+    "infty": "∞",
+    "times": "×",
+    "cdot": "·",
+    "div": "÷",
+    "pm": "±",
+    "mp": "∓",
+    "neq": "≠",
+    "leq": "≤",
+    "geq": "≥",
+    "approx": "≈",
+    "equiv": "≡",
+    "propto": "∝",
+    "in": "∈",
+    "notin": "∉",
+    "cup": "∪",
+    "cap": "∩",
+    "subset": "⊂",
+    "subseteq": "⊆",
+    "emptyset": "∅",
+    "therefore": "∴",
+    "because": "∵",
+    "perp": "⊥",
+    "parallel": "∥",
+    "rightarrow": "→",
+    "leftarrow": "←",
+    "Rightarrow": "⇒",
+    "Leftrightarrow": "⇔",
+    "degree": "°",
+    "cdots": "⋯",
+    "ldots": "…",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "partial": "∂",
+    "nabla": "∇",
+    "forall": "∀",
+    "exists": "∃",
+    "sin": "sin",
+    "cos": "cos",
+    "tan": "tan",
+    "cot": "cot",
+    "sec": "sec",
+    "csc": "csc",
+    "arcsin": "sin⁻¹",
+    "arccos": "cos⁻¹",
+    "arctan": "tan⁻¹",
+    "arccot": "cot⁻¹",
+    "arcsec": "sec⁻¹",
+    "arccsc": "csc⁻¹",
+    "log": "log",
+    "ln": "ln",
+    "lim": "lim",
+    "max": "max",
+    "min": "min",
 }
 
 
 def read_group(text, start):
+
     if start >= len(text) or text[start] != "{":
         return None, start
 
     depth = 0
 
     for i in range(start, len(text)):
+
         if text[i] == "{":
             depth += 1
 
@@ -359,93 +504,27 @@ def read_group(text, start):
     return None, start
 
 
-def replace_braced_commands(text):
-    commands = (
-        r"\dfrac",
-        r"\tfrac",
-        r"\frac",
+def convert_fractions(text):
+
+    pattern = re.compile(
+        r"\\(?:dfrac|tfrac|frac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}"
     )
 
-    for command in commands:
-        result = ""
-        i = 0
+    previous = None
 
-        while i < len(text):
-            if text.startswith(command, i):
-                j = i + len(command)
+    while previous != text:
+        previous = text
 
-                while j < len(text) and text[j].isspace():
-                    j += 1
+        text = pattern.sub(
+            lambda m: f"({m.group(1)})⁄({m.group(2)})",
+            text
+        )
 
-                numerator, next_pos = read_group(text, j)
-
-                if numerator is not None:
-                    j = next_pos
-
-                    while j < len(text) and text[j].isspace():
-                        j += 1
-
-                    denominator, next_pos = read_group(text, j)
-
-                    if denominator is not None:
-                        result += (
-                            "(" + numerator + ")"
-                            + "⁄"
-                            + "(" + denominator + ")"
-                        )
-
-                        i = next_pos
-                        continue
-
-            result += text[i]
-            i += 1
-
-        text = result
-
-    # Square roots
-    result = ""
-    i = 0
-
-    while i < len(text):
-        if text.startswith(r"\sqrt", i):
-            j = i + 5
-
-            while j < len(text) and text[j].isspace():
-                j += 1
-
-            # Optional root index
-            if j < len(text) and text[j] == "[":
-                end = text.find("]", j)
-
-                if end != -1:
-                    root_index = text[j + 1:end]
-                    j = end + 1
-                else:
-                    root_index = ""
-            else:
-                root_index = ""
-
-            group, next_pos = read_group(text, j)
-
-            if group is not None:
-                if root_index:
-                    result += (
-                        root_index + "√(" + group + ")"
-                    )
-                else:
-                    result += "√(" + group + ")"
-
-                i = next_pos
-                continue
-
-        result += text[i]
-        i += 1
-
-    return result
+    return text
 
 
 def latex_to_unicode(text):
-    # Math delimiters
+
     text = text.replace(r"\(", "")
     text = text.replace(r"\)", "")
     text = text.replace(r"\[", "")
@@ -453,8 +532,16 @@ def latex_to_unicode(text):
     text = text.replace("$$", "")
     text = text.replace("$", "")
 
-    # Fractions and square roots
-    text = replace_braced_commands(text)
+    text = convert_fractions(text)
+
+    # Square roots
+    text = re.sub(
+        r"\\sqrt(?:\[(.*?)\])?\{([^{}]*)\}",
+        lambda m: (
+            (m.group(1) + "√") if m.group(1) else "√"
+        ) + f"({m.group(2)})",
+        text
+    )
 
     # Superscripts
     text = re.sub(
@@ -482,67 +569,81 @@ def latex_to_unicode(text):
         text
     )
 
-    # Remove formatting commands
-    formatting_commands = (
-        r"\displaystyle",
-        r"\textstyle",
-        r"\scriptstyle",
-        r"\left",
-        r"\right",
-        r"\mathrm",
-        r"\mathbf",
-        r"\mathit",
-        r"\mathsf",
-        r"\mathtt",
-        r"\mathcal",
-        r"\mathbb",
-        r"\operatorname",
-        r"\text",
-        r"\boxed",
-        r"\overline",
-        r"\underline",
-        r"\vec",
-        r"\hat",
-        r"\bar",
-        r"\tilde",
+    # Remove simple formatting wrappers
+    for command in (
+        "text",
+        "mathrm",
+        "mathbf",
+        "mathit",
+        "mathsf",
+        "mathbb",
+        "mathcal",
+        "operatorname",
+        "boxed",
+        "overline",
+        "underline",
+        "vec",
+        "hat",
+        "bar",
+        "tilde",
+    ):
+
+        text = re.sub(
+            r"\\" + command + r"\{([^{}]*)\}",
+            r"\1",
+            text
+        )
+
+    text = re.sub(
+        r"\\begin\{[^{}]*\}|\\end\{[^{}]*\}",
+        "",
+        text
     )
 
-    for command in formatting_commands:
-        text = text.replace(command, "")
+    text = re.sub(
+        r"\\([A-Za-z]+)",
+        lambda m: LATEX_SYMBOLS.get(
+            m.group(1),
+            m.group(1)
+        ),
+        text
+    )
 
-    # Mathematical symbols
-    for command, symbol in sorted(
-        LATEX_SYMBOLS.items(),
-        key=lambda item: len(item[0]),
-        reverse=True
-    ):
-        text = text.replace(command, symbol)
+    replacements = {
+        r"\{": "{",
+        r"\}": "}",
+        r"\,": " ",
+        r"\;": " ",
+        r"\:": " ",
+        r"\!": "",
+        r"\%": "%",
+        r"\#": "#",
+        r"\$": "$",
+        r"\&": "&",
+        r"\_": "_",
+    }
 
-    # Remaining basic commands
-    text = text.replace(r"\{", "{")
-    text = text.replace(r"\}", "}")
-    text = text.replace(r"\,", " ")
-    text = text.replace(r"\;", " ")
-    text = text.replace(r"\:", " ")
-    text = text.replace(r"\!", "")
-    text = text.replace(r"\ ", " ")
-    text = text.replace(r"\%", "%")
-    text = text.replace(r"\#", "#")
-    text = text.replace(r"\$", "$")
+    for old, new in replacements.items():
+        text = text.replace(old, new)
 
     return text
 
 
-# ---------------- MARKDOWN ----------------
-
-def safe_text(value):
-    return html.escape(str(value))
-
+# ==================================================
+# MARKDOWN AND PARAGRAPH FORMATTING
+# ==================================================
 
 def format_inline(text):
-    text = latex_to_unicode(text)
 
-    text = safe_text(text)
+    text = latex_to_unicode(text)
+    text = html.escape(text)
+
+    # Inline code
+    text = re.sub(
+        r"`([^`]+)`",
+        r'<font name="Courier">\1</font>',
+        text
+    )
 
     # Bold
     text = re.sub(
@@ -558,328 +659,303 @@ def format_inline(text):
         text
     )
 
-    # Inline code
+    # Strikethrough
     text = re.sub(
-        r"`(.+?)`",
-        r'<font name="Courier">\1</font>',
+        r"~~(.+?)~~",
+        r"<strike>\1</strike>",
         text
     )
 
-    return text
+    return font_fallback(text)
 
 
-def make_message_paragraphs(text, style):
+def split_long_line(line, limit=450):
+
+    result = []
+
+    while len(line) > limit:
+
+        pos = line.rfind(" ", 0, limit)
+
+        if pos <= 0:
+            pos = limit
+
+        result.append(line[:pos])
+        line = line[pos:].lstrip()
+
+    if line:
+        result.append(line)
+
+    return result
+
+
+def make_message_paragraphs(text, styles):
+
     output = []
+    code_mode = False
+    code_lines = []
 
-    for line in text.splitlines():
+    for raw_line in text.splitlines():
+
+        line = raw_line.rstrip()
+
+        if line.strip().startswith("```"):
+
+            if not code_mode:
+                code_mode = True
+                code_lines = []
+            else:
+                code_mode = False
+
+                code_text = "<br/>".join(
+                    html.escape(x) for x in code_lines
+                )
+
+                output.append(
+                    Paragraph(
+                        f'<font name="Courier">{code_text}</font>',
+                        styles["code"]
+                    )
+                )
+
+            continue
+
+        if code_mode:
+            code_lines.append(line)
+            continue
+
         line = line.strip()
 
         if not line:
             output.append(Spacer(1, 4))
             continue
 
-        # Headings
-        if line.startswith("### "):
+        if line in ("---", "***", "___"):
             output.append(
-                Paragraph(
-                    "<b>" + format_inline(line[4:]) + "</b>",
-                    style
+                HRFlowable(
+                    width="100%",
+                    thickness=0.6,
+                    color=colors.HexColor("#BBBBBB"),
+                    spaceBefore=5,
+                    spaceAfter=7,
                 )
             )
             continue
 
-        if line.startswith("## "):
+        heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
+
+        if heading_match:
+
+            level = len(heading_match.group(1))
+            content = heading_match.group(2)
+
+            heading_style = styles[
+                "h1" if level == 1 else
+                "h2" if level == 2 else "h3"
+            ]
+
             output.append(
                 Paragraph(
-                    "<b>" + format_inline(line[3:]) + "</b>",
-                    style
+                    "<b>" + format_inline(content) + "</b>",
+                    heading_style
                 )
             )
+
             continue
 
-        if line.startswith("# "):
+        if line.startswith(">"):
+            line = "│ " + line.lstrip("> ")
+
+        list_match = re.match(
+            r"^(\s*)([-*+]|\d+[.)])\s+(.*)",
+            raw_line
+        )
+
+        if list_match:
+            marker = list_match.group(2)
+            content = list_match.group(3)
+
+            line = (
+                "• " + content
+                if marker in ("-", "*", "+")
+                else marker + " " + content
+            )
+
+        for chunk in split_long_line(line):
+
             output.append(
                 Paragraph(
-                    "<b>" + format_inline(line[2:]) + "</b>",
-                    style
+                    format_inline(chunk),
+                    styles["body"]
                 )
             )
-            continue
 
-        # Bullet lists
-        if line.startswith("- ") or line.startswith("* "):
-            line = "• " + line[2:]
+    if code_mode and code_lines:
+
+        code_text = "<br/>".join(
+            html.escape(x) for x in code_lines
+        )
 
         output.append(
             Paragraph(
-                format_inline(line),
-                style
+                f'<font name="Courier">{code_text}</font>',
+                styles["code"]
             )
         )
 
     return output
 
 
-# ---------------- CHAT BUBBLES ----------------
+# ==================================================
+# CHAT BUBBLE DESIGN
+# ==================================================
 
-def create_bubble(message, styles):
+def create_bubble(message, paragraph, first=False):
+
     is_user = message["role"] == "user"
 
     if is_user:
+
         background = colors.HexColor("#DCEBFF")
-        border = colors.HexColor("#C2DAF8")
+        border = colors.HexColor("#B9D3F5")
         text_color = colors.HexColor("#17365D")
         heading = "You"
         alignment = "RIGHT"
 
     else:
-        background = colors.HexColor("#EEEEEE")
+
+        background = colors.HexColor("#F0F0F0")
         border = colors.HexColor("#DDDDDD")
-        text_color = colors.HexColor("#242424")
+        text_color = colors.HexColor("#252525")
         heading = "ChatGPT"
         alignment = "LEFT"
 
-    bubble_style = ParagraphStyle(
-        "BubbleText",
-        fontName=FONT,
-        fontSize=10.5,
-        leading=16,
-        textColor=text_color,
-        wordWrap="CJK",
-        spaceAfter=4,
-    )
+    elements = []
 
-    heading_style = ParagraphStyle(
-        "BubbleHeading",
-        fontName=BOLD_FONT,
-        fontSize=9,
-        leading=13,
-        textColor=text_color,
-        spaceAfter=6,
-    )
+    if first:
 
-    content = [
-        Paragraph(
-            heading,
-            heading_style
+        heading_style = ParagraphStyle(
+            "BubbleHeading",
+            fontName=BOLD,
+            fontSize=9,
+            leading=12,
+            textColor=text_color,
+            spaceAfter=4,
         )
-    ]
 
-    content.extend(
-        make_message_paragraphs(
-            message["text"],
-            bubble_style
+        elements.append(
+            Paragraph(heading, heading_style)
         )
-    )
+
+    if isinstance(paragraph, Paragraph):
+        elements.append(paragraph)
+    else:
+        elements.append(paragraph)
 
     bubble = Table(
-        [[content]],
-        colWidths=[145 * mm],
+        [[elements]],
+        colWidths=[166 * mm],
         hAlign=alignment,
+        splitByRow=1,
     )
 
     bubble.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), background),
-        ("BOX", (0, 0), (-1, -1), 0.7, border),
-        ("LEFTPADDING", (0, 0), (-1, -1), 12),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
-        ("ROUNDEDCORNERS", [12, 12, 12, 12]),
+        ("BOX", (0, 0), (-1, -1), 0.65, border),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 11),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 11),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
 
     return bubble
 
 
-# ---------------- PDF ----------------
+# ==================================================
+# PDF HEADER AND FOOTER
+# ==================================================
+
+def draw_page(canvas_obj, doc):
+
+    canvas_obj.saveState()
+
+    # Footer line
+    canvas_obj.setStrokeColor(
+        colors.HexColor("#E0E0E0")
+    )
+
+    canvas_obj.setLineWidth(0.5)
+
+    canvas_obj.line(
+        17 * mm,
+        12 * mm,
+        PAGE_WIDTH - 17 * mm,
+        12 * mm,
+    )
+
+    canvas_obj.setFont(REGULAR, 8)
+
+    canvas_obj.setFillColor(
+        colors.HexColor("#777777")
+    )
+
+    canvas_obj.drawString(
+        17 * mm,
+        7 * mm,
+        "ChatGPT Conversation PDF"
+    )
+
+    canvas_obj.drawRightString(
+        PAGE_WIDTH - 17 * mm,
+        7 * mm,
+        f"Page {doc.page}"
+    )
+
+    canvas_obj.restoreState()
+
+
+# ==================================================
+# CREATE PDF
+# ==================================================
 
 def make_pdf(title, messages, filename):
+
     path = PDF_DIR / filename
 
     doc = SimpleDocTemplate(
         str(path),
         pagesize=A4,
-        rightMargin=17 * mm,
-        leftMargin=17 * mm,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
         topMargin=16 * mm,
-        bottomMargin=16 * mm,
+        bottomMargin=19 * mm,
         title=title,
+        author="ChatGPT PDF Bot",
+        subject="ChatGPT Conversation",
+        pageCompression=1,
     )
 
-    styles = getSampleStyleSheet()
+    styles = {
 
-    title_style = ParagraphStyle(
-        "ChatTitle",
-        fontName=BOLD_FONT,
-        fontSize=17,
-        leading=23,
-        alignment=1,
-        textColor=colors.HexColor("#174EA6"),
-        spaceAfter=16,
-    )
-
-    story = [
-        Paragraph(
-            safe_text(title),
-            title_style
+        "body": ParagraphStyle(
+            "Body",
+            fontName=REGULAR,
+            fontSize=10,
+            leading=15,
+            textColor=colors.HexColor("#252525"),
+            wordWrap="CJK",
+            spaceAfter=5,
         ),
-        Spacer(1, 8),
-    ]
 
-    for message in messages:
-        story.append(
-            create_bubble(message, styles)
-        )
+        "h1": ParagraphStyle(
+            "H1",
+            fontName=BOLD,
+            fontSize=15,
+            leading=20,
+            textColor=colors.HexColor("#174EA6"),
+            spaceBefore=7,
+            spaceAfter=8,
+        ),
 
-        story.append(
-            Spacer(1, 10)
-        )
-
-    doc.build(story)
-
-    return path
-
-
-# ---------------- FLASK ----------------
-
-@app.route("/")
-def home():
-    return "ChatGPT PDF Bot is running."
-
-
-@app.route("/pdf/<filename>")
-def serve_pdf(filename):
-    if Path(filename).name != filename:
-        abort(404)
-
-    path = PDF_DIR / filename
-
-    if not path.is_file():
-        abort(404)
-
-    return send_from_directory(
-        str(PDF_DIR),
-        filename,
-        mimetype="application/pdf",
-        as_attachment=False,
-    )
-
-
-# ---------------- TELEGRAM ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "नमस्ते! 👋\n\n"
-        "ChatGPT conversation का Share Link भेजें।\n"
-        "मैं उसे ChatGPT-style coloured bubbles वाली PDF में बदल दूँगा।"
-    )
-
-
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    url = update.message.text.strip()
-
-    if "chatgpt.com/share/" not in url:
-        await update.message.reply_text(
-            "कृपया सही ChatGPT Share Link भेजें।"
-        )
-        return
-
-    status = await update.message.reply_text(
-        "⏳ Chat पढ़ी जा रही है और PDF बनाई जा रही है..."
-    )
-
-    try:
-        data = fetch_conversation(url)
-
-        messages = extract_chat(data)
-
-        title = (
-            data.get("title")
-            or "ChatGPT Conversation"
-        )
-
-        filename = f"{uuid.uuid4()}.pdf"
-
-        make_pdf(
-            title,
-            messages,
-            filename
-        )
-
-        if not BASE_URL:
-            raise ValueError("BASE_URL missing")
-
-        pdf_url = f"{BASE_URL}/pdf/{filename}"
-
-        await status.edit_text(
-            "✅ आपकी ChatGPT-style PDF तैयार है!\n\n"
-            f"💬 Total messages: {len(messages)}\n\n"
-            f"🔗 PDF Link:\n{pdf_url}"
-        )
-
-    except requests.exceptions.RequestException as error:
-        print("REQUEST ERROR:", repr(error))
-
-        await status.edit_text(
-            "❌ ChatGPT Share Link से data नहीं मिला।"
-        )
-
-    except Exception as error:
-        print("PDF ERROR:", repr(error))
-
-        await status.edit_text(
-            "❌ PDF बनाने में समस्या आई। Logs में error देखें।"
-        )
-
-
-# ---------------- START SERVER ----------------
-
-def run_flask():
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False,
-    )
-
-
-if __name__ == "__main__":
-
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable missing"
-        )
-
-    threading.Thread(
-        target=run_flask,
-        daemon=True
-    ).start()
-
-    bot = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    bot.add_handler(
-        CommandHandler("start", start)
-    )
-
-    bot.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message
-        )
-    )
-
-    print("Telegram PDF Bot Started!")
-
-    bot.run_polling()
-    
+        "h2": Paragraph
