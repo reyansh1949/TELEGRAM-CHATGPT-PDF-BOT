@@ -4,12 +4,12 @@ import uuid
 import threading
 import logging
 from pathlib import Path
+from io import BytesIO
 from xml.sax.saxutils import escape
 
 import requests
 import matplotlib
 matplotlib.use("Agg")
-
 from matplotlib.mathtext import math_to_image
 
 from flask import Flask, send_from_directory
@@ -24,7 +24,7 @@ from telegram.ext import (
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -33,8 +33,7 @@ from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    Image as RLImage,
-    PageBreak
+    Image as RLImage
 )
 
 # ==================================================
@@ -49,9 +48,12 @@ logging.basicConfig(
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment Variables mein missing hai.")
+    raise RuntimeError("BOT_TOKEN missing hai.")
 
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+BASE_URL = os.environ.get(
+    "RENDER_EXTERNAL_URL", ""
+).rstrip("/")
+
 PORT = int(os.environ.get("PORT", 10000))
 
 PDF_DIR = Path("/tmp/pdfs")
@@ -60,7 +62,7 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
 
 # ==================================================
-# WEBSITE ROUTES
+# WEBSITE
 # ==================================================
 
 @app.route("/")
@@ -86,9 +88,8 @@ def download_pdf(filename):
         mimetype="application/pdf"
     )
 
-
 # ==================================================
-# HINDI FONT
+# FONT
 # ==================================================
 
 def setup_font():
@@ -119,7 +120,7 @@ def setup_font():
             TTFont("HindiFont", str(font_path))
         )
 
-        logging.info("Hindi font loaded successfully.")
+        logging.info("Hindi font loaded.")
 
         return "HindiFont"
 
@@ -132,9 +133,8 @@ def setup_font():
 
 FONT_NAME = setup_font()
 
-
 # ==================================================
-# EXTRACT CHATGPT SHARE CONVERSATION
+# EXTRACT ASSISTANT ANSWERS
 # ==================================================
 
 def extract_chat(url):
@@ -145,9 +145,7 @@ def extract_chat(url):
     )
 
     if not match:
-        raise ValueError(
-            "Valid ChatGPT public share link bhejein."
-        )
+        raise ValueError("Valid ChatGPT share link bhejein.")
 
     share_id = match.group(1)
 
@@ -175,51 +173,68 @@ def extract_chat(url):
 
     messages = []
 
-    for node in mapping.values():
+    # Conversation tree ko parent-child order mein traverse karo.
+    root_ids = [
+        node_id
+        for node_id, node in mapping.items()
+        if not node.get("parent")
+    ]
+
+    visited = set()
+
+    def visit(node_id):
+
+        if node_id in visited:
+            return
+
+        visited.add(node_id)
+
+        node = mapping.get(node_id)
+
+        if not node:
+            return
 
         message = node.get("message")
 
-        if not message:
-            continue
+        if message:
 
-        role = message.get("author", {}).get("role", "")
+            role = message.get(
+                "author", {}
+            ).get("role", "")
 
-        # Only Assistant responses
-        if role != "assistant":
-            continue
+            metadata = message.get("metadata") or {}
 
-        metadata = message.get("metadata") or {}
-
-        message_type = metadata.get("message_type", "")
-
-        # Skip internal/non-final message types
-        if message_type in (
-            "analysis",
-            "commentary",
-            "summary",
-            "notification"
-        ):
-            continue
-
-        content = message.get("content") or {}
-
-        parts = content.get("parts") or []
-
-        text_parts = []
-
-        for part in parts:
-
-            if isinstance(part, str) and part.strip():
-                text_parts.append(part.strip())
-
-        if text_parts:
-
-            messages.append(
-                "\n".join(text_parts)
+            message_type = metadata.get(
+                "message_type", ""
             )
 
-    if not messages:
+            if role == "assistant" and message_type not in (
+                "analysis",
+                "commentary",
+                "summary",
+                "notification"
+            ):
 
+                content = message.get("content") or {}
+
+                parts = content.get("parts") or []
+
+                text_parts = [
+                    part.strip()
+                    for part in parts
+                    if isinstance(part, str) and part.strip()
+                ]
+
+                if text_parts:
+                    messages.append("\n".join(text_parts))
+
+        for child_id in node.get("children", []):
+            visit(child_id)
+
+    for root_id in root_ids:
+        visit(root_id)
+
+    if not messages:
         raise ValueError(
             "Assistant ka answer nahi mila. "
             "Share link public hona chahiye."
@@ -227,9 +242,8 @@ def extract_chat(url):
 
     return title, "\n\n".join(messages)
 
-
 # ==================================================
-# MATHEMATICAL FORMULA DETECTION
+# LATEX MATH RENDERING
 # ==================================================
 
 MATH_PATTERN = re.compile(
@@ -245,21 +259,31 @@ def render_math(expression):
 
     expression = expression.strip()
 
-    image_path = PDF_DIR / (
-        "math_" + str(uuid.uuid4()) + ".png"
-    )
+    # Common LaTeX commands not directly supported by MathText
+    replacements = {
+        r"\dfrac": r"\frac",
+        r"\tfrac": r"\frac",
+        r"\left": "",
+        r"\right": "",
+        r"\cdot": r"\cdot",
+        r"\times": r"\times",
+    }
 
-    # Matplotlib MathText rendering
+    for old, new in replacements.items():
+        expression = expression.replace(old, new)
+
+    buffer = BytesIO()
+
     math_to_image(
         "$" + expression + "$",
-        str(image_path),
+        buffer,
         dpi=200,
         format="png"
     )
 
-    image_reader = ImageReader(str(image_path))
+    buffer.seek(0)
 
-    width, height = image_reader.getSize()
+    width, height = ImageReader(buffer).getSize()
 
     max_width = 165 * mm
     max_height = 45 * mm
@@ -270,23 +294,23 @@ def render_math(expression):
         1
     )
 
+    buffer.seek(0)
+
     return RLImage(
-        str(image_path),
+        buffer,
         width=width * scale,
         height=height * scale,
         hAlign="CENTER"
     )
 
-
 # ==================================================
-# MARKDOWN TEXT FORMATTING
+# MARKDOWN FORMATTING
 # ==================================================
 
 def format_markdown(text):
 
     text = escape(text)
 
-    # Bold
     text = re.sub(
         r"\*\*(.+?)\*\*",
         r"<b>\1</b>",
@@ -294,14 +318,12 @@ def format_markdown(text):
         flags=re.DOTALL
     )
 
-    # Italic
     text = re.sub(
         r"(?<!\*)\*([^*]+)\*(?!\*)",
         r"<i>\1</i>",
         text
     )
 
-    # Inline code
     text = re.sub(
         r"`([^`]+)`",
         r'<font name="Courier">\1</font>',
@@ -310,18 +332,13 @@ def format_markdown(text):
 
     return text
 
-
 # ==================================================
-# PDF TEXT AND MATH PROCESSING
+# PDF CONTENT
 # ==================================================
 
-def add_content_to_pdf(story, content, styles):
+def add_content(story, content, styles):
 
-    body_style = styles["body"]
-    heading_style = styles["heading"]
-    small_style = styles["small"]
-
-    # Remove Markdown code fence markers
+    # Remove code fences but preserve their contents
     content = re.sub(
         r"```[a-zA-Z0-9_+-]*\s*",
         "",
@@ -330,93 +347,76 @@ def add_content_to_pdf(story, content, styles):
 
     content = content.replace("```", "")
 
-    lines = content.splitlines()
-
-    for line in lines:
+    for line in content.splitlines():
 
         line = line.strip()
 
         if not line:
-
             story.append(Spacer(1, 5))
-
             continue
 
         # Headings
         if line.startswith("### "):
-
-            heading = format_markdown(line[4:])
-
             story.append(
-                Paragraph(heading, heading_style)
+                Paragraph(
+                    format_markdown(line[4:]),
+                    styles["Heading3Custom"]
+                )
             )
-
             continue
 
         if line.startswith("## "):
-
-            heading = format_markdown(line[3:])
-
             story.append(
-                Paragraph(heading, heading_style)
+                Paragraph(
+                    format_markdown(line[3:]),
+                    styles["Heading2Custom"]
+                )
             )
-
             continue
 
         if line.startswith("# "):
-
-            heading = format_markdown(line[2:])
-
             story.append(
-                Paragraph(heading, heading_style)
+                Paragraph(
+                    format_markdown(line[2:]),
+                    styles["Heading1Custom"]
+                )
             )
-
             continue
 
-        # Horizontal separator
         if line in ("---", "***", "___"):
-
             story.append(Spacer(1, 8))
-
             continue
 
-        # Formula detection
+        # Detect math inside a line
         matches = list(MATH_PATTERN.finditer(line))
 
         if matches:
 
-            last_position = 0
+            position = 0
 
             for match in matches:
 
-                before = line[last_position:match.start()].strip()
+                before = line[position:match.start()].strip()
 
                 if before:
-
                     story.append(
                         Paragraph(
                             format_markdown(before),
-                            body_style
+                            styles["BodyCustom"]
                         )
                     )
 
                 expression = next(
-                    group
-                    for group in match.groups()
-                    if group is not None
+                    item for item in match.groups()
+                    if item is not None
                 )
 
                 try:
-
-                    formula_image = render_math(expression)
-
-                    story.append(formula_image)
-
+                    story.append(render_math(expression))
                     story.append(Spacer(1, 5))
 
                 except Exception:
-
-                    logging.warning(
+                    logging.exception(
                         "Math rendering failed: %s",
                         expression
                     )
@@ -424,69 +424,65 @@ def add_content_to_pdf(story, content, styles):
                     story.append(
                         Paragraph(
                             escape(match.group(0)),
-                            small_style
+                            styles["BodyCustom"]
                         )
                     )
 
-                last_position = match.end()
+                position = match.end()
 
-            remaining = line[last_position:].strip()
+            remaining = line[position:].strip()
 
             if remaining:
-
                 story.append(
                     Paragraph(
                         format_markdown(remaining),
-                        body_style
+                        styles["BodyCustom"]
                     )
                 )
 
             story.append(Spacer(1, 5))
-
             continue
 
-        # Bullet points
+        # Bullet list
         if line.startswith("- ") or line.startswith("* "):
-
-            bullet_text = format_markdown(line[2:])
 
             story.append(
                 Paragraph(
-                    "&#8226;&nbsp;&nbsp;" + bullet_text,
-                    body_style
+                    "&#8226;&nbsp;&nbsp;" +
+                    format_markdown(line[2:]),
+                    styles["BodyCustom"]
                 )
             )
 
             continue
 
         # Numbered list
-        numbered = re.match(r"^(\d+)\.\s+(.*)$", line)
+        numbered = re.match(
+            r"^(\d+)\.\s+(.*)$",
+            line
+        )
 
         if numbered:
 
-            number = numbered.group(1)
-
-            text = format_markdown(numbered.group(2))
-
             story.append(
                 Paragraph(
-                    f"<b>{number}.</b>&nbsp;{text}",
-                    body_style
+                    "<b>" + numbered.group(1) +
+                    ".</b>&nbsp;" +
+                    format_markdown(numbered.group(2)),
+                    styles["BodyCustom"]
                 )
             )
 
             continue
 
-        # Normal text
         story.append(
             Paragraph(
                 format_markdown(line),
-                body_style
+                styles["BodyCustom"]
             )
         )
 
         story.append(Spacer(1, 4))
-
 
 # ==================================================
 # CREATE PDF
@@ -502,7 +498,7 @@ def make_pdf(title, content):
 
     styles.add(
         ParagraphStyle(
-            name="CustomTitle",
+            "TitleCustom",
             parent=styles["Title"],
             fontName=FONT_NAME,
             fontSize=19,
@@ -512,38 +508,33 @@ def make_pdf(title, content):
         )
     )
 
+    for name, size in (
+        ("Heading1Custom", 17),
+        ("Heading2Custom", 14),
+        ("Heading3Custom", 12)
+    ):
+
+        styles.add(
+            ParagraphStyle(
+                name,
+                parent=styles["Heading2"],
+                fontName=FONT_NAME,
+                fontSize=size,
+                leading=size + 6,
+                spaceBefore=10,
+                spaceAfter=7
+            )
+        )
+
     styles.add(
         ParagraphStyle(
-            name="body",
+            "BodyCustom",
             parent=styles["Normal"],
             fontName=FONT_NAME,
             fontSize=11,
             leading=17,
-            alignment=TA_LEFT,
             spaceAfter=6,
             wordWrap="CJK"
-        )
-    )
-
-    styles.add(
-        ParagraphStyle(
-            name="heading",
-            parent=styles["Heading2"],
-            fontName=FONT_NAME,
-            fontSize=14,
-            leading=20,
-            spaceBefore=10,
-            spaceAfter=8
-        )
-    )
-
-    styles.add(
-        ParagraphStyle(
-            name="small",
-            parent=styles["Normal"],
-            fontName=FONT_NAME,
-            fontSize=9,
-            leading=13
         )
     )
 
@@ -557,30 +548,22 @@ def make_pdf(title, content):
         title=title
     )
 
-    story = []
-
-    story.append(
+    story = [
         Paragraph(
             format_markdown(title),
-            styles["CustomTitle"]
-        )
-    )
+            styles["TitleCustom"]
+        ),
+        Spacer(1, 12)
+    ]
 
-    story.append(Spacer(1, 12))
-
-    add_content_to_pdf(
-        story,
-        content,
-        styles
-    )
+    add_content(story, content, styles)
 
     document.build(story)
 
     return filename
 
-
 # ==================================================
-# TELEGRAM COMMANDS
+# TELEGRAM BOT
 # ==================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -605,22 +588,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Aapki PDF ban rahi hai. Kripya wait karein..."
+        "PDF ban rahi hai. Kripya wait karein..."
     )
 
     try:
 
         title, content = extract_chat(url)
 
-        filename = make_pdf(
-            title,
-            content
-        )
+        filename = make_pdf(title, content)
 
         if not BASE_URL:
-
             raise RuntimeError(
-                "Render external URL available nahi hai."
+                "Render external URL missing hai."
             )
 
         pdf_url = BASE_URL + "/pdf/" + filename
@@ -634,13 +613,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("PDF conversion failed")
 
         await update.message.reply_text(
-            "PDF conversion failed:\n"
-            + str(error)[:700]
+            "Conversion failed:\n" + str(error)[:700]
         )
 
-
 # ==================================================
-# RUN FLASK WEBSITE
+# RUN WEBSITE
 # ==================================================
 
 def run_website():
@@ -652,10 +629,6 @@ def run_website():
         use_reloader=False
     )
 
-
-# ==================================================
-# MAIN
-# ==================================================
 
 def main():
 
@@ -689,6 +662,5 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
     
