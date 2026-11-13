@@ -1,5 +1,4 @@
 python-telegram-bot==22.8
-flask
-requests
-reportlab
-matplotlib
+Flask>=3.0,<4.0
+requests>=2.31
+reportlab>=4.2
