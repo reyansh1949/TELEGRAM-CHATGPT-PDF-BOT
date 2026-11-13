@@ -2,3 +2,4 @@ python-telegram-bot==22.8
 flask
 requests
 reportlab
+matplotlib
