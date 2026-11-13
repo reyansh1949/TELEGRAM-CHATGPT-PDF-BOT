@@ -1,0 +1,5 @@
+python-telegram-bot
+flask
+requests
+reportlab
+gunicorn
