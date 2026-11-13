@@ -1,29 +1,15 @@
+
 import os
 import re
 import uuid
+import html
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
-
-import requests
-import matplotlib
-matplotlib.use("Agg")
-from matplotlib.mathtext import math_to_image
-
-from flask import Flask, send_from_directory, abort
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
-    PageBreak
-)
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.utils import simpleSplit
 from io import BytesIO
 
+import requests
+from flask import Flask, send_from_directory, abort
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -33,7 +19,19 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------- CONFIGURATION ----------------
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer,
+    Table, TableStyle, Image
+)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.utils import ImageReader
+
+# ---------------- CONFIG ----------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get(
@@ -46,34 +44,38 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
-# ---------------- HINDI FONT ----------------
+# ---------------- FONT ----------------
 
-FONT_NAME = "Helvetica"
-BOLD_FONT_NAME = "Helvetica-Bold"
+FONT = "Helvetica"
+BOLD_FONT = "Helvetica-Bold"
 
-font_path = Path("NotoSansDevanagari-Regular.ttf")
-bold_font_path = Path("NotoSansDevanagari-Bold.ttf")
+regular_font = Path("NotoSansDevanagari-Regular.ttf")
+bold_font = Path("NotoSansDevanagari-Bold.ttf")
 
-if font_path.exists():
-    pdfmetrics.registerFont(TTFont("HindiFont", str(font_path)))
-    FONT_NAME = "HindiFont"
+if regular_font.exists():
+    pdfmetrics.registerFont(
+        TTFont("HindiFont", str(regular_font))
+    )
+    FONT = "HindiFont"
 
-if bold_font_path.exists():
-    pdfmetrics.registerFont(TTFont("HindiFont-Bold", str(bold_font_path)))
-    BOLD_FONT_NAME = "HindiFont-Bold"
+if bold_font.exists():
+    pdfmetrics.registerFont(
+        TTFont("HindiFontBold", str(bold_font))
+    )
+    BOLD_FONT = "HindiFontBold"
 
-# ---------------- SHARE LINK ----------------
+# ---------------- CHATGPT SHARE API ----------------
 
 def get_share_id(url):
     parsed = urlparse(url.strip())
 
     if parsed.netloc not in ("chatgpt.com", "www.chatgpt.com"):
-        raise ValueError("Please send a valid ChatGPT share link.")
+        raise ValueError("Invalid ChatGPT share link")
 
     match = re.search(r"/share/([^/?#]+)", parsed.path)
 
     if not match:
-        raise ValueError("Share link में conversation ID नहीं मिली।")
+        raise ValueError("Share ID not found")
 
     return match.group(1)
 
@@ -98,49 +100,38 @@ def fetch_conversation(url):
     response.raise_for_status()
     data = response.json()
 
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+    if isinstance(data.get("data"), dict):
         data = data["data"]
 
-    if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
-        raise ValueError(
-            "ChatGPT से conversation data नहीं मिला। "
-            "हो सकता है share link private हो या API बदल गई हो।"
-        )
+    if not isinstance(data.get("mapping"), dict):
+        raise ValueError("Conversation data unavailable")
 
     return data
 
 
-# ---------------- CONVERSATION EXTRACTION ----------------
+# ---------------- EXTRACT CHAT ----------------
 
 def get_active_path(data):
     mapping = data["mapping"]
-    current_node = data.get("current_node")
+    current = data.get("current_node")
 
-    # Current selected conversation branch
-    if current_node in mapping:
+    if current in mapping:
         path = []
         visited = set()
-        node_id = current_node
 
-        while node_id and node_id in mapping and node_id not in visited:
-            visited.add(node_id)
-            node = mapping[node_id]
+        while current and current in mapping and current not in visited:
+            visited.add(current)
+            node = mapping[current]
             path.append(node)
-            node_id = node.get("parent")
+            current = node.get("parent")
 
-        path.reverse()
-        return path
+        return list(reversed(path))
 
-    # Fallback: select the deepest/latest leaf
-    parents = {}
+    # Fallback if current_node is unavailable
     children = set()
 
-    for node_id, node in mapping.items():
-        parent = node.get("parent")
-        parents[node_id] = parent
-
-        for child in node.get("children") or []:
-            children.add(child)
+    for node in mapping.values():
+        children.update(node.get("children") or [])
 
     leaves = [
         node_id for node_id in mapping
@@ -148,208 +139,102 @@ def get_active_path(data):
     ]
 
     if not leaves:
-        leaves = list(mapping.keys())
+        leaves = list(mapping)
 
-    def get_path(node_id):
-        result = []
-        visited = set()
+    def build_path(node_id):
+        path = []
+        seen = set()
 
-        while node_id and node_id in mapping and node_id not in visited:
-            visited.add(node_id)
-            result.append(mapping[node_id])
-            node_id = parents.get(node_id)
+        while node_id and node_id in mapping and node_id not in seen:
+            seen.add(node_id)
+            node = mapping[node_id]
+            path.append(node)
+            node_id = node.get("parent")
 
-        result.reverse()
-        return result
-
-    candidates = [get_path(node_id) for node_id in leaves]
+        return list(reversed(path))
 
     return max(
-        candidates,
-        key=lambda p: (
-            len(p),
-            float(
-                (p[-1].get("message") or {}).get("create_time") or 0
-            ) if p else 0
-        ),
+        (build_path(x) for x in leaves),
+        key=len
     )
 
 
-def extract_message_text(content):
+def extract_text(content):
     if not isinstance(content, dict):
         return ""
 
     parts = content.get("parts")
 
     if parts is None:
-        text_value = content.get("text")
-        return text_value if isinstance(text_value, str) else ""
+        return content.get("text", "")
 
-    output = []
+    result = []
 
     for part in parts:
         if isinstance(part, str):
-            output.append(part)
+            result.append(part)
 
         elif isinstance(part, dict):
             if isinstance(part.get("text"), str):
-                output.append(part["text"])
+                result.append(part["text"])
             elif part.get("content_type") == "image":
-                output.append("[Image attached]")
+                result.append("[Image attached]")
             elif part.get("content_type") in ("audio", "video"):
-                output.append("[Media attached]")
+                result.append("[Media attached]")
 
-    return "\n".join(output).strip()
+    return "\n".join(result).strip()
 
 
 def extract_chat(data):
     messages = []
-    path = get_active_path(data)
 
-    for node in path:
+    for node in get_active_path(data):
         message = node.get("message")
 
         if not isinstance(message, dict):
             continue
 
-        author = message.get("author") or {}
-        role = author.get("role")
+        role = (message.get("author") or {}).get("role")
 
         if role not in ("user", "assistant"):
             continue
 
-        metadata = message.get("metadata") or {}
-
-        # Hide internal analysis and tool calls.
         if role == "assistant":
-            message_type = metadata.get("message_type")
+            metadata = message.get("metadata") or {}
 
-            if message_type in ("analysis", "commentary", "notification"):
+            if metadata.get("message_type") in (
+                "analysis",
+                "commentary",
+                "notification",
+            ):
                 continue
 
             recipient = message.get("recipient")
             if recipient and recipient != "all":
                 continue
 
-        content = message.get("content") or {}
-        text = extract_message_text(content)
+        text = extract_text(message.get("content") or {})
 
-        if not text:
-            continue
-
-        messages.append({
-            "role": role,
-            "text": text,
-        })
+        if text:
+            messages.append({
+                "role": role,
+                "text": text,
+            })
 
     if not messages:
-        raise ValueError("इस share link में पढ़ने योग्य messages नहीं मिले।")
+        raise ValueError("No readable messages found")
 
     return messages
 
 
-# ---------------- FORMULA RENDERING ----------------
+# ---------------- MARKDOWN ----------------
 
-def render_formula(formula):
-    formula = formula.strip()
-
-    # Common LaTeX commands supported by Matplotlib MathText
-    formula = formula.replace(r"\displaystyle", "")
-    formula = formula.replace(r"\left", "")
-    formula = formula.replace(r"\right", "")
-
-    buffer = BytesIO()
-
-    try:
-        math_to_image(
-            "$" + formula + "$",
-            buffer,
-            dpi=180,
-            format="png",
-        )
-        buffer.seek(0)
-
-        image = RLImage(buffer)
-        max_width = 165 * mm
-
-        if image.drawWidth > max_width:
-            scale = max_width / image.drawWidth
-            image.drawWidth *= scale
-            image.drawHeight *= scale
-
-        return image
-
-    except Exception:
-        return None
+def safe_text(value):
+    return html.escape(str(value))
 
 
-def add_text_and_formulas(story, text, styles):
-    lines = text.splitlines()
-
-    block_formula_pattern = re.compile(
-        r"^\s*(?:\$\$(.*?)\$\$|\\\[(.*?)\\\])\s*$"
-    )
-
-    inline_formula_pattern = re.compile(
-        r"\\\((.+?)\\\)|(?<!\\)\$(.+?)(?<!\\)\$"
-    )
-
-    for line in lines:
-        stripped = line.strip()
-
-        if not stripped:
-            story.append(Spacer(1, 4))
-            continue
-
-        block_match = block_formula_pattern.match(stripped)
-
-        if block_match:
-            formula = block_match.group(1) or block_match.group(2)
-            image = render_formula(formula)
-
-            if image:
-                story.append(Spacer(1, 5))
-                story.append(image)
-                story.append(Spacer(1, 5))
-            else:
-                story.append(Paragraph(
-                    escape_text(formula),
-                    styles["body"]
-                ))
-            continue
-
-        # Basic Markdown formatting
-        segments = inline_formula_pattern.split(line)
-
-        for index, segment in enumerate(segments):
-            if segment is None or segment == "":
-                continue
-
-            # Formula groups are at odd indexes
-            if index % 3 in (1, 2):
-                image = render_formula(segment)
-                if image:
-                    story.append(image)
-                else:
-                    story.append(Paragraph(
-                        escape_text(segment),
-                        styles["body"]
-                    ))
-            else:
-                formatted = format_markdown(segment)
-                story.append(Paragraph(formatted, styles["body"]))
-
-
-def escape_text(text):
-    text = str(text)
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    return text
-
-
-def format_markdown(text):
-    text = escape_text(text)
+def format_inline(text):
+    text = safe_text(text)
 
     text = re.sub(
         r"\*\*(.+?)\*\*",
@@ -365,92 +250,175 @@ def format_markdown(text):
 
     text = re.sub(
         r"`(.+?)`",
-        r"<font name='Courier'>\1</font>",
+        r'<font name="Courier">\1</font>',
         text
     )
 
     return text
 
 
-# ---------------- PDF GENERATION ----------------
+def make_message_paragraphs(text, style):
+    output = []
+
+    for line in text.splitlines():
+        line = line.strip()
+
+        if not line:
+            output.append(Spacer(1, 4))
+            continue
+
+        # Headings
+        if line.startswith("### "):
+            output.append(
+                Paragraph(
+                    "<b>" + format_inline(line[4:]) + "</b>",
+                    style
+                )
+            )
+            continue
+
+        if line.startswith("## "):
+            output.append(
+                Paragraph(
+                    "<b>" + format_inline(line[3:]) + "</b>",
+                    style
+                )
+            )
+            continue
+
+        if line.startswith("# "):
+            output.append(
+                Paragraph(
+                    "<b>" + format_inline(line[2:]) + "</b>",
+                    style
+                )
+            )
+            continue
+
+        # Bullet lists
+        if line.startswith("- ") or line.startswith("* "):
+            line = "• " + line[2:]
+
+        output.append(
+            Paragraph(format_inline(line), style)
+        )
+
+    return output
+
+
+# ---------------- CHAT BUBBLES ----------------
+
+def create_bubble(message, styles):
+    is_user = message["role"] == "user"
+
+    if is_user:
+        background = colors.HexColor("#DCEBFF")
+        border = colors.HexColor("#C2DAF8")
+        text_color = colors.HexColor("#17365D")
+        heading = "You"
+        alignment = "RIGHT"
+        left_padding = 12
+        right_padding = 12
+    else:
+        background = colors.HexColor("#EEEEEE")
+        border = colors.HexColor("#DDDDDD")
+        text_color = colors.HexColor("#242424")
+        heading = "ChatGPT"
+        alignment = "LEFT"
+        left_padding = 12
+        right_padding = 12
+
+    bubble_style = ParagraphStyle(
+        "BubbleText",
+        fontName=FONT,
+        fontSize=10.5,
+        leading=16,
+        textColor=text_color,
+        wordWrap="CJK",
+        spaceAfter=4,
+    )
+
+    heading_style = ParagraphStyle(
+        "BubbleHeading",
+        fontName=BOLD_FONT,
+        fontSize=9,
+        leading=13,
+        textColor=text_color,
+        spaceAfter=6,
+    )
+
+    content = [
+        Paragraph(heading, heading_style)
+    ]
+
+    content.extend(
+        make_message_paragraphs(
+            message["text"],
+            bubble_style
+        )
+    )
+
+    bubble = Table(
+        [[content]],
+        colWidths=[145 * mm],
+        hAlign=alignment,
+    )
+
+    bubble.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), background),
+        ("BOX", (0, 0), (-1, -1), 0.7, border),
+        ("LEFTPADDING", (0, 0), (-1, -1), left_padding),
+        ("RIGHTPADDING", (0, 0), (-1, -1), right_padding),
+        ("TOPPADDING", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("ROUNDEDCORNERS", [12, 12, 12, 12]),
+    ]))
+
+    return bubble
+
+
+# ---------------- PDF ----------------
 
 def make_pdf(title, messages, filename):
-    file_path = PDF_DIR / filename
+    path = PDF_DIR / filename
 
     doc = SimpleDocTemplate(
-        str(file_path),
+        str(path),
         pagesize=A4,
-        rightMargin=18 * mm,
-        leftMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
+        rightMargin=17 * mm,
+        leftMargin=17 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
         title=title,
-        author="ChatGPT Conversation PDF Bot",
     )
 
     styles = getSampleStyleSheet()
 
-    styles.add(ParagraphStyle(
-        name="PDFTitle",
-        fontName=BOLD_FONT_NAME,
-        fontSize=18,
-        leading=25,
+    title_style = ParagraphStyle(
+        "ChatTitle",
+        fontName=BOLD_FONT,
+        fontSize=17,
+        leading=23,
         alignment=1,
         textColor=colors.HexColor("#174EA6"),
-        spaceAfter=18,
-    ))
+        spaceAfter=16,
+    )
 
-    styles.add(ParagraphStyle(
-        name="MessageHeading",
-        fontName=BOLD_FONT_NAME,
-        fontSize=12,
-        leading=18,
-        textColor=colors.HexColor("#174EA6"),
-        spaceBefore=12,
-        spaceAfter=6,
-    ))
-
-    styles.add(ParagraphStyle(
-        name="body",
-        fontName=FONT_NAME,
-        fontSize=10.5,
-        leading=17,
-        spaceAfter=5,
-        wordWrap="CJK",
-    ))
-
-    story = []
-
-    story.append(Paragraph(
-        escape_text(title or "ChatGPT Conversation"),
-        styles["PDFTitle"]
-    ))
-
-    story.append(Spacer(1, 8))
+    story = [
+        Paragraph(safe_text(title), title_style),
+        Spacer(1, 8),
+    ]
 
     for message in messages:
-        role = message["role"]
-        heading = "User" if role == "user" else "ChatGPT"
-
-        story.append(Paragraph(
-            heading,
-            styles["MessageHeading"]
-        ))
-
-        add_text_and_formulas(
-            story,
-            message["text"],
-            styles
-        )
-
-        story.append(Spacer(1, 8))
+        story.append(create_bubble(message, styles))
+        story.append(Spacer(1, 10))
 
     doc.build(story)
 
-    return file_path
+    return path
 
 
-# ---------------- FLASK PDF ROUTE ----------------
+# ---------------- FLASK ----------------
 
 @app.route("/")
 def home():
@@ -462,9 +430,9 @@ def serve_pdf(filename):
     if Path(filename).name != filename:
         abort(404)
 
-    file_path = PDF_DIR / filename
+    path = PDF_DIR / filename
 
-    if not file_path.exists():
+    if not path.is_file():
         abort(404)
 
     return send_from_directory(
@@ -475,13 +443,13 @@ def serve_pdf(filename):
     )
 
 
-# ---------------- TELEGRAM BOT ----------------
+# ---------------- TELEGRAM ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "नमस्ते! 👋\n\n"
-        "मुझे ChatGPT conversation का Share Link भेजें।\n"
-        "मैं उसे PDF में बदलकर आपको PDF का public link दूँगा।"
+        "ChatGPT conversation का Share Link भेजें।\n"
+        "मैं उसे ChatGPT-style coloured bubbles वाली PDF में बदल दूँगा।"
     )
 
 
@@ -493,12 +461,12 @@ async def handle_message(
 
     if "chatgpt.com/share/" not in url:
         await update.message.reply_text(
-            "कृपया ChatGPT का सही Share Link भेजें।"
+            "कृपया सही ChatGPT Share Link भेजें।"
         )
         return
 
     status = await update.message.reply_text(
-        "⏳ Conversation पढ़ी जा रही है और PDF बन रही है..."
+        "⏳ Chat पढ़ी जा रही है और PDF बनाई जा रही है..."
     )
 
     try:
@@ -511,34 +479,34 @@ async def handle_message(
         make_pdf(title, messages, filename)
 
         if not BASE_URL:
-            raise ValueError(
-                "BASE_URL या RENDER_EXTERNAL_URL सेट नहीं है।"
-            )
+            raise ValueError("BASE_URL missing")
 
         pdf_url = f"{BASE_URL}/pdf/{filename}"
 
         await status.edit_text(
-            "✅ PDF तैयार है!\n\n"
-            f"📄 Messages: {len(messages)}\n\n"
+            "✅ आपकी ChatGPT-style PDF तैयार है!\n\n"
+            f"💬 Total messages: {len(messages)}\n\n"
             f"🔗 PDF Link:\n{pdf_url}"
         )
 
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as error:
+        print("REQUEST ERROR:", repr(error))
         await status.edit_text(
-            "❌ ChatGPT share link से data नहीं मिल पाया। "
-            "Link public है या नहीं, जाँचें।"
+            "❌ ChatGPT Share Link से data नहीं मिला।"
         )
 
     except Exception as error:
         print("PDF ERROR:", repr(error))
         await status.edit_text(
-            "❌ PDF बनाने में समस्या आई। "
-            "कृपया दूसरा share link भेजकर कोशिश करें।"
+            "❌ PDF बनाने में समस्या आई। Logs में error देखें।"
         )
 
 
+# ---------------- START SERVER ----------------
+
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
+
     app.run(
         host="0.0.0.0",
         port=port,
@@ -547,11 +515,9 @@ def run_flask():
     )
 
 
-# ---------------- START ----------------
-
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable missing.")
+        raise RuntimeError("BOT_TOKEN environment variable missing")
 
     threading.Thread(
         target=run_flask,
@@ -561,10 +527,14 @@ if __name__ == "__main__":
     bot = ApplicationBuilder().token(BOT_TOKEN).build()
 
     bot.add_handler(CommandHandler("start", start))
+
     bot.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
     )
 
-    print("Telegram bot started.")
+    print("Telegram PDF Bot Started!")
     bot.run_polling()
     
