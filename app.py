@@ -1662,7 +1662,8 @@ def run_telegram_bot():
     )
 
     application.run_polling(
-        drop_pending_updates=True
+    drop_pending_updates=True,
+    stop_signals=None
     )
 
 
