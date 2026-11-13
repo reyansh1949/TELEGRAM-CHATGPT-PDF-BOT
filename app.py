@@ -938,72 +938,728 @@ def make_pdf(title, messages, filename):
 
     styles = {
 
-        "body": ParagraphStyle(
-            "Body",
-            fontName=REGULAR,
-            fontSize=10,
-            leading=15,
-            textColor=colors.HexColor("#252525"),
-            wordWrap="CJK",
-            spaceAfter=5,
-        ),
+    "body": ParagraphStyle(
+        "Body",
+        fontName=REGULAR,
+        fontSize=10,
+        leading=15,
+        textColor=colors.HexColor("#252525"),
+        wordWrap="CJK",
+        spaceAfter=5,
+    ),
 
-        "h1": ParagraphStyle(
-            "H1",
-            fontName=BOLD,
-            fontSize=15,
-            leading=20,
-            textColor=colors.HexColor("#174EA6"),
-            spaceBefore=7,
-            spaceAfter=8,
-        ),
+    "h1": ParagraphStyle(
+        "H1",
+        fontName=BOLD,
+        fontSize=15,
+        leading=20,
+        textColor=colors.HexColor("#174EA6"),
+        spaceBefore=7,
+        spaceAfter=8,
+    ),
 
-        
-"h2": ParagraphStyle(
-    "H2",
-    fontName=BOLD,
-    fontSize=12,
-    leading=16,
-    textColor=colors.HexColor("#202124"),
-    spaceBefore=6,
-    spaceAfter=6,
-),
+    "h2": ParagraphStyle(
+        "H2",
+        fontName=BOLD,
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#202124"),
+        spaceBefore=6,
+        spaceAfter=6,
+    ),
 
-"h3": ParagraphStyle(
-    "H3",
-    fontName=BOLD,
-    fontSize=11,
-    leading=14,
-    textColor=colors.HexColor("#188038"),
-    spaceBefore=5,
-    spaceAfter=5,
-),
+    "h3": ParagraphStyle(
+        "H3",
+        fontName=BOLD,
+        fontSize=11,
+        leading=14,
+        textColor=colors.HexColor("#188038"),
+        spaceBefore=5,
+        spaceAfter=5,
+    ),
 
-"small": ParagraphStyle(
-    "Small",
-    fontName=REGULAR,
-    fontSize=8,
-    leading=11,
-    textColor=colors.HexColor("#777777"),
-),
+    "small": ParagraphStyle(
+        "Small",
+        fontName=REGULAR,
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#777777"),
+    ),
 
-"user": ParagraphStyle(
-    "User",
-    fontName=BOLD,
-    fontSize=10,
-    leading=15,
-    textColor=colors.HexColor("#174EA6"),
-    spaceAfter=5,
-),
+    "user": ParagraphStyle(
+        "User",
+        fontName=BOLD,
+        fontSize=10,
+        leading=15,
+        textColor=colors.HexColor("#174EA6"),
+        spaceAfter=5,
+    ),
 
-"assistant": ParagraphStyle(
-    "Assistant",
-    fontName=REGULAR,
-    fontSize=10,
-    leading=15,
-    textColor=colors.HexColor("#252525"),
-    spaceAfter=5,
-),
+    "assistant": ParagraphStyle(
+        "Assistant",
+        fontName=REGULAR,
+        fontSize=10,
+        leading=15,
+        textColor=colors.HexColor("#252525"),
+        spaceAfter=5,
+    ),
 
-    }
-    
+    "code": ParagraphStyle(
+        "Code",
+        fontName="Courier",
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#202124"),
+        backColor=colors.HexColor("#F6F8FA"),
+        leftIndent=5,
+        rightIndent=5,
+        spaceBefore=4,
+        spaceAfter=6,
+    ),
+
+}
+
+# ==================================================
+# BUILD CHAT BUBBLES
+# ==================================================
+
+story = []
+
+first_role = None
+
+for message in messages:
+
+    role = message["role"]
+
+    if role != first_role:
+        first = True
+        first_role = role
+    else:
+        first = False
+
+    paragraphs = make_message_paragraphs(
+        message["text"],
+        styles
+    )
+
+    for paragraph in paragraphs:
+        bubble = create_bubble(
+            message,
+            paragraph,
+            first=first
+        )
+
+        story.append(bubble)
+        story.append(Spacer(1, 7))
+
+        first = False
+
+
+if not story:
+    story.append(
+        Paragraph(
+            "No conversation content found.",
+            styles["body"]
+        )
+    )
+
+
+doc.build(
+    story,
+    onFirstPage=draw_page,
+    onLaterPages=draw_page,
+)
+
+return path
+
+
+# ==================================================
+# FLASK ROUTES
+# ==================================================
+
+@app.route("/")
+def home():
+
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ChatGPT PDF Bot</title>
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
+        <style>
+
+            body {
+                font-family: Arial, sans-serif;
+                background: #f5f7fb;
+                text-align: center;
+                padding: 60px 20px;
+            }
+
+            .box {
+                max-width: 600px;
+                margin: auto;
+                background: white;
+                padding: 35px;
+                border-radius: 16px;
+                box-shadow: 0 5px 25px rgba(0,0,0,.08);
+            }
+
+            h1 {
+                color: #174ea6;
+            }
+
+            p {
+                color: #555;
+            }
+
+        </style>
+    </head>
+
+    <body>
+
+        <div class="box">
+
+            <h1>ChatGPT PDF Bot</h1>
+
+            <p>
+                Telegram bot is running successfully.
+            </p>
+
+            <p>
+                Send a ChatGPT share link to the Telegram bot
+                to generate a chat-style PDF.
+            </p>
+
+        </div>
+
+    </body>
+    </html>
+    """
+
+
+@app.route("/pdf/<path:filename>")
+def serve_pdf(filename):
+
+    file_path = PDF_DIR / filename
+
+    if not file_path.is_file():
+        abort(404)
+
+    return send_from_directory(
+        PDF_DIR,
+        filename,
+        mimetype="application/pdf",
+        as_attachment=False,
+    )
+
+
+# ==================================================
+# TELEGRAM BOT
+# ==================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "👋 Welcome!\n\n"
+        "Send me a ChatGPT shared conversation link "
+        "and I will convert it into a chat-style PDF."
+    )
+
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    text = (
+        update.message.text or ""
+    ).strip()
+
+    if not text:
+        return
+
+    if "/share/" not in text:
+
+        await update.message.reply_text(
+            "Please send a valid ChatGPT share link."
+        )
+
+        return
+
+    status = await update.message.reply_text(
+        "⏳ Reading the ChatGPT conversation..."
+    )
+
+    try:
+
+        data = fetch_conversation(text)
+
+        await status.edit_text(
+            "📝 Extracting conversation..."
+        )
+
+        messages = extract_chat(data)
+
+        await status.edit_text(
+            "📄 Creating PDF..."
+        )
+
+        filename = (
+            f"chatgpt_{uuid.uuid4().hex}.pdf"
+        )
+
+        make_pdf(
+            "ChatGPT Conversation",
+            messages,
+            filename
+        )
+
+        if BASE_URL:
+
+            pdf_url = (
+                f"{BASE_URL}/pdf/{filename}"
+            )
+
+            await status.edit_text(
+                "✅ PDF created successfully!\n\n"
+                f"📄 {pdf_url}"
+            )
+
+        else:
+
+            await status.edit_text(
+                "✅ PDF created successfully.\n\n"
+                "BASE_URL is not configured."
+            )
+
+    except requests.HTTPError as e:
+
+        print(
+            "HTTP ERROR:",
+            repr(e)
+        )
+
+        await status.edit_text(
+            "❌ Could not fetch the ChatGPT conversation.\n\n"
+            f"HTTP error: {e}"
+        )
+
+    except Exception as e:
+
+        print(
+            "ERROR:",
+            repr(e)
+        )
+
+        await status.edit_text(
+            "❌ Failed to create PDF.\n\n"
+            f"Error: {e}"
+        )
+
+
+# ==================================================
+# START TELEGRAM BOT
+# ==================================================
+
+def run_telegram_bot():
+
+    if not BOT_TOKEN:
+
+        print(
+            "ERROR: BOT_TOKEN environment variable "
+            "is not set."
+        )
+
+        return
+
+    print("Starting Telegram bot...")
+
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
+    )
+
+    print(
+        "Telegram bot is starting polling..."
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# ==================================================
+# RENDER STARTUP
+# ==================================================
+
+def main():
+
+    bot_thread = threading.Thread(
+        target=run_telegram_bot,
+        daemon=True
+    )
+
+    bot_thread.start()
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    print(
+        f"Starting Flask server on port {port}..."
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+    )
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+if __name__ == "__main__":
+    main()
+        bubble = create_bubble(
+            message,
+            paragraph,
+            first=first
+        )
+
+        story.append(bubble)
+        story.append(Spacer(1, 7))
+
+        first = False
+
+if not story:
+    story.append(
+        Paragraph(
+            "No conversation content found.",
+            styles["body"]
+        )
+    )
+
+doc.build(
+    story,
+    onFirstPage=draw_page,
+    onLaterPages=draw_page,
+)
+
+return path
+
+
+# ==================================================
+# FLASK ROUTES
+# ==================================================
+
+@app.route("/")
+def home():
+
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>ChatGPT PDF Bot</title>
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+
+        <style>
+
+            body {
+                font-family: Arial, sans-serif;
+                background: #f5f7fb;
+                text-align: center;
+                padding: 60px 20px;
+            }
+
+            .box {
+                max-width: 600px;
+                margin: auto;
+                background: white;
+                padding: 35px;
+                border-radius: 16px;
+                box-shadow: 0 5px 25px rgba(0,0,0,.08);
+            }
+
+            h1 {
+                color: #174ea6;
+            }
+
+            p {
+                color: #555;
+            }
+
+        </style>
+    </head>
+
+    <body>
+
+        <div class="box">
+
+            <h1>ChatGPT PDF Bot</h1>
+
+            <p>
+                Telegram bot is running successfully.
+            </p>
+
+            <p>
+                Send a ChatGPT share link to the Telegram bot
+                to generate a chat-style PDF.
+            </p>
+
+        </div>
+
+    </body>
+    </html>
+    """
+
+
+@app.route("/pdf/<path:filename>")
+def serve_pdf(filename):
+
+    file_path = PDF_DIR / filename
+
+    if not file_path.is_file():
+        abort(404)
+
+    return send_from_directory(
+        PDF_DIR,
+        filename,
+        mimetype="application/pdf",
+        as_attachment=False,
+    )
+
+
+# ==================================================
+# TELEGRAM BOT
+# ==================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "👋 Welcome!\n\n"
+        "Send me a ChatGPT shared conversation link "
+        "and I will convert it into a chat-style PDF."
+    )
+
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    text = (
+        update.message.text or ""
+    ).strip()
+
+    if not text:
+        return
+
+    if "/share/" not in text:
+
+        await update.message.reply_text(
+            "Please send a valid ChatGPT share link."
+        )
+
+        return
+
+    status = await update.message.reply_text(
+        "⏳ Reading the ChatGPT conversation..."
+    )
+
+    try:
+
+        data = fetch_conversation(text)
+
+        await status.edit_text(
+            "📝 Extracting conversation..."
+        )
+
+        messages = extract_chat(data)
+
+        await status.edit_text(
+            "📄 Creating PDF..."
+        )
+
+        filename = (
+            f"chatgpt_{uuid.uuid4().hex}.pdf"
+        )
+
+        make_pdf(
+            "ChatGPT Conversation",
+            messages,
+            filename
+        )
+
+        if BASE_URL:
+
+            pdf_url = (
+                f"{BASE_URL}/pdf/{filename}"
+            )
+
+            await status.edit_text(
+                "✅ PDF created successfully!\n\n"
+                f"📄 {pdf_url}"
+            )
+
+        else:
+
+            await status.edit_text(
+                "✅ PDF created successfully.\n\n"
+                "BASE_URL is not configured."
+            )
+
+    except requests.HTTPError as e:
+
+        print(
+            "HTTP ERROR:",
+            repr(e)
+        )
+
+        await status.edit_text(
+            "❌ Could not fetch the ChatGPT conversation.\n\n"
+            f"HTTP error: {e}"
+        )
+
+    except Exception as e:
+
+        print(
+            "ERROR:",
+            repr(e)
+        )
+
+        await status.edit_text(
+            "❌ Failed to create PDF.\n\n"
+            f"Error: {e}"
+        )
+
+
+# ==================================================
+# START TELEGRAM BOT
+# ==================================================
+
+def run_telegram_bot():
+
+    if not BOT_TOKEN:
+
+        print(
+            "ERROR: BOT_TOKEN environment variable "
+            "is not set."
+        )
+
+        return
+
+    print(
+        "Starting Telegram bot..."
+    )
+
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
+    )
+
+    print(
+        "Telegram bot is starting polling..."
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# ==================================================
+# RENDER STARTUP
+# ==================================================
+
+def main():
+
+    bot_thread = threading.Thread(
+        target=run_telegram_bot,
+        daemon=True
+    )
+
+    bot_thread.start()
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    print(
+        f"Starting Flask server on port {port}..."
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+    )
+
+
+# ==================================================
+# MAIN
+# ==================================================
+
+if __name__ == "__main__":
+    main()
